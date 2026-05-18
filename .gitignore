@@ -1,0 +1,40 @@
+# Built binaries
+/terraform-provider-awssigv4
+*.exe
+dist/
+
+# Go test artifacts
+*.test
+*.out
+coverage.txt
+
+# Terraform working state
+.terraform/
+.terraform.lock.hcl
+.terraform.tfstate.lock.info
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# Terraform crash logs
+crash.log
+crash.*.log
+
+# tfvars files often contain secrets — don't commit unless intentional.
+*.tfvars
+*.tfvars.json
+
+# Terraform's local-override mechanism — usually machine-specific.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Machine-local Terraform CLI config
+.terraformrc
+terraform.rc
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
