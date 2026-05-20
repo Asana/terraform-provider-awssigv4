@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/ephemeral/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/ephemeral"
 	"github.com/hashicorp/terraform-plugin-framework/ephemeral/schema"
@@ -36,11 +37,11 @@ const (
 	emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	unsignedPayload    = "UNSIGNED-PAYLOAD"
 
-	defaultRetryAttempts     int64   = 3
-	defaultRetryMinDelayMs   int64   = 1000
-	defaultRetryMaxDelayMs   int64   = 30000
-	defaultRetryMultiplier   float64 = 2.0
-	defaultMaxRedirects      int64   = 10
+	defaultRetryAttempts          int           = 3
+	defaultRetryMinDelay          time.Duration = 1 * time.Second
+	defaultRetryMaxDelay          time.Duration = 30 * time.Second
+	defaultRetryMultiplier        float64       = 2.0
+	defaultMaxRedirects           int           = 10
 )
 
 // defaultRetryStatusCodes is the standard transient-failure set.
@@ -63,19 +64,20 @@ type sigV4RequestModel struct {
 	Region                 types.String `tfsdk:"region"`
 	RequestHeaders         types.Map    `tfsdk:"request_headers"`
 	RequestBody            types.String `tfsdk:"request_body"`
-	RequestTimeoutMs       types.Int64  `tfsdk:"request_timeout_ms"`
+	RequestTimeout         types.String `tfsdk:"request_timeout"`
 	CACertPEM              types.String `tfsdk:"ca_cert_pem"`
 	Insecure               types.Bool   `tfsdk:"insecure"`
 	SignBody               types.Bool   `tfsdk:"sign_body"`
 	SetContentSha256Header types.Bool   `tfsdk:"set_content_sha256_header"`
 
-	ExpectedStatusCodes         types.List  `tfsdk:"expected_status_codes"`
-	IncludeResponseBodyInErrors types.Bool  `tfsdk:"include_response_body_in_errors"`
-	FollowRedirects             types.Bool  `tfsdk:"follow_redirects"`
-	MaxRedirects                types.Int64 `tfsdk:"max_redirects"`
-	AllowedRedirectHosts        types.List  `tfsdk:"allowed_redirect_hosts"`
-	MaxResponseBodyBytes        types.Int64 `tfsdk:"max_response_body_bytes"`
-	Retry                       *retryModel `tfsdk:"retry"`
+	ExpectedStatusCodes         types.List     `tfsdk:"expected_status_codes"`
+	IncludeResponseBodyInErrors types.Bool     `tfsdk:"include_response_body_in_errors"`
+	FollowRedirects             types.Bool     `tfsdk:"follow_redirects"`
+	MaxRedirects                types.Int64    `tfsdk:"max_redirects"`
+	AllowedRedirectHosts        types.List     `tfsdk:"allowed_redirect_hosts"`
+	MaxResponseBodyBytes        types.Int64    `tfsdk:"max_response_body_bytes"`
+	Retry                       *retryModel    `tfsdk:"retry"`
+	Timeouts                    timeouts.Value `tfsdk:"timeouts"`
 
 	StatusCode         types.Int64  `tfsdk:"status_code"`
 	Ok                 types.Bool   `tfsdk:"ok"`
@@ -89,8 +91,8 @@ type sigV4RequestModel struct {
 // retryModel maps the optional `retry { ... }` block.
 type retryModel struct {
 	Attempts           types.Int64   `tfsdk:"attempts"`
-	MinDelayMs         types.Int64   `tfsdk:"min_delay_ms"`
-	MaxDelayMs         types.Int64   `tfsdk:"max_delay_ms"`
+	MinDelay           types.String  `tfsdk:"min_delay"`
+	MaxDelay           types.String  `tfsdk:"max_delay"`
 	Multiplier         types.Float64 `tfsdk:"multiplier"`
 	OnStatusCodes      types.List    `tfsdk:"on_status_codes"`
 	OnConnectionErrors types.Bool    `tfsdk:"on_connection_errors"`
@@ -114,7 +116,7 @@ func (r *sigV4RequestEphemeralResource) Metadata(_ context.Context, req ephemera
 	resp.TypeName = req.ProviderTypeName + "_request"
 }
 
-func (r *sigV4RequestEphemeralResource) Schema(_ context.Context, _ ephemeral.SchemaRequest, resp *ephemeral.SchemaResponse) {
+func (r *sigV4RequestEphemeralResource) Schema(ctx context.Context, _ ephemeral.SchemaRequest, resp *ephemeral.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Sends an AWS SigV4-signed HTTP request to an arbitrary endpoint and exposes the response. " +
 			"Credentials come from the provider's configured AWS credential chain (env vars, profiles, `credential_process`, SSO, " +
@@ -146,9 +148,11 @@ func (r *sigV4RequestEphemeralResource) Schema(_ context.Context, _ ephemeral.Sc
 				Optional:    true,
 				Description: "Request body. Hashed for SigV4 unless `sign_body = false`.",
 			},
-			"request_timeout_ms": schema.Int64Attribute{
-				Optional:    true,
-				Description: "Per-attempt timeout in milliseconds. `0` (default) means no client-side timeout. With retries enabled, this applies to each attempt individually.",
+			"request_timeout": schema.StringAttribute{
+				Optional: true,
+				Description: "Per-attempt HTTP timeout as a Go duration string (e.g. `\"5s\"`, `\"500ms\"`). " +
+					"Unset or empty means no client-side timeout. With retries enabled, this applies to each attempt individually; " +
+					"for an end-to-end budget covering all attempts and backoffs, use `timeouts { open = \"...\" }`.",
 			},
 			"ca_cert_pem": schema.StringAttribute{
 				Optional:    true,
@@ -247,13 +251,13 @@ func (r *sigV4RequestEphemeralResource) Schema(_ context.Context, _ ephemeral.Sc
 						Optional:    true,
 						Description: "Total attempts including the first one. Defaults to `3` when the block is present.",
 					},
-					"min_delay_ms": schema.Int64Attribute{
+					"min_delay": schema.StringAttribute{
 						Optional:    true,
-						Description: "Initial delay before the first retry, in milliseconds. Defaults to `1000`.",
+						Description: "Initial delay before the first retry as a Go duration string (e.g. `\"1s\"`, `\"500ms\"`). Defaults to `\"1s\"`.",
 					},
-					"max_delay_ms": schema.Int64Attribute{
+					"max_delay": schema.StringAttribute{
 						Optional:    true,
-						Description: "Upper bound on the backoff delay, in milliseconds. Defaults to `30000`.",
+						Description: "Upper bound on the backoff delay as a Go duration string. Defaults to `\"30s\"`.",
 					},
 					"multiplier": schema.Float64Attribute{
 						Optional: true,
@@ -272,6 +276,7 @@ func (r *sigV4RequestEphemeralResource) Schema(_ context.Context, _ ephemeral.Sc
 					},
 				},
 			},
+			"timeouts": timeouts.Block(ctx),
 		},
 	}
 }
@@ -374,14 +379,29 @@ func (r *sigV4RequestEphemeralResource) Open(ctx context.Context, req ephemeral.
 		return
 	}
 
+	// End-to-end timeout from the `timeouts { open = "..." }` block, if set.
+	openTimeout, diags := data.Timeouts.Open(ctx, 0)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if openTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, openTimeout)
+		defer cancel()
+	}
+
 	maxBodyBytes := int64(0)
 	if !data.MaxResponseBodyBytes.IsNull() && !data.MaxResponseBodyBytes.IsUnknown() {
 		maxBodyBytes = data.MaxResponseBodyBytes.ValueInt64()
 	}
 
-	client, err := buildHTTPClient(ctx, data)
+	client, err := buildHTTPClient(ctx, data, &resp.Diagnostics)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to build HTTP client", err.Error())
+		return
+	}
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
@@ -575,8 +595,8 @@ func computeBackoff(retryIndex int, minDelay, maxDelay time.Duration, multiplier
 func parseRetryPolicy(ctx context.Context, m *retryModel) (retryPolicy, diag.Diagnostics) {
 	policy := retryPolicy{
 		attempts:           1,
-		minDelay:           time.Duration(defaultRetryMinDelayMs) * time.Millisecond,
-		maxDelay:           time.Duration(defaultRetryMaxDelayMs) * time.Millisecond,
+		minDelay:           defaultRetryMinDelay,
+		maxDelay:           defaultRetryMaxDelay,
 		multiplier:         defaultRetryMultiplier,
 		onStatusCodes:      append([]int(nil), defaultRetryStatusCodes...),
 		onConnectionErrors: true,
@@ -586,26 +606,34 @@ func parseRetryPolicy(ctx context.Context, m *retryModel) (retryPolicy, diag.Dia
 	}
 
 	// Block present — default attempts up from 1.
-	policy.attempts = int(defaultRetryAttempts)
+	policy.attempts = defaultRetryAttempts
 
+	var diags diag.Diagnostics
 	if !m.Attempts.IsNull() && !m.Attempts.IsUnknown() {
 		policy.attempts = int(m.Attempts.ValueInt64())
 		if policy.attempts < 1 {
 			policy.attempts = 1
 		}
 	}
-	if !m.MinDelayMs.IsNull() && !m.MinDelayMs.IsUnknown() {
-		policy.minDelay = time.Duration(m.MinDelayMs.ValueInt64()) * time.Millisecond
+	if d, ok := parseDurationField(m.MinDelay, path.Root("retry").AtName("min_delay"), &diags); ok {
+		policy.minDelay = d
 	}
-	if !m.MaxDelayMs.IsNull() && !m.MaxDelayMs.IsUnknown() {
-		policy.maxDelay = time.Duration(m.MaxDelayMs.ValueInt64()) * time.Millisecond
+	if diags.HasError() {
+		return policy, diags
+	}
+	if d, ok := parseDurationField(m.MaxDelay, path.Root("retry").AtName("max_delay"), &diags); ok {
+		policy.maxDelay = d
+	}
+	if diags.HasError() {
+		return policy, diags
 	}
 	if !m.Multiplier.IsNull() && !m.Multiplier.IsUnknown() {
 		policy.multiplier = m.Multiplier.ValueFloat64()
 	}
 	if !m.OnStatusCodes.IsNull() && !m.OnStatusCodes.IsUnknown() {
-		codes, diags := int64ListAsInts(ctx, m.OnStatusCodes)
-		if diags != nil {
+		codes, d := int64ListAsInts(ctx, m.OnStatusCodes)
+		if d.HasError() {
+			diags.Append(d...)
 			return policy, diags
 		}
 		// Distinguish empty list (disable) from null (use defaults).
@@ -614,7 +642,30 @@ func parseRetryPolicy(ctx context.Context, m *retryModel) (retryPolicy, diag.Dia
 	if !m.OnConnectionErrors.IsNull() && !m.OnConnectionErrors.IsUnknown() {
 		policy.onConnectionErrors = m.OnConnectionErrors.ValueBool()
 	}
-	return policy, nil
+	return policy, diags
+}
+
+// parseDurationField parses a types.String as a Go duration. Returns (0, false)
+// when the field is null/unknown/empty. Adds a framework diagnostic on parse
+// failure and returns (0, false).
+func parseDurationField(v types.String, attrPath path.Path, diags *diag.Diagnostics) (time.Duration, bool) {
+	if v.IsNull() || v.IsUnknown() {
+		return 0, false
+	}
+	s := strings.TrimSpace(v.ValueString())
+	if s == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		diags.AddAttributeError(
+			attrPath,
+			"Invalid duration",
+			fmt.Sprintf("Could not parse %q as a Go duration (e.g. %q, %q, %q): %s", s, "500ms", "5s", "1m30s", err),
+		)
+		return 0, false
+	}
+	return d, true
 }
 
 // int64ListAsInts decodes a types.List of int64 into []int. Null/unknown lists
@@ -634,7 +685,7 @@ func int64ListAsInts(ctx context.Context, l types.List) ([]int, diag.Diagnostics
 	return out, nil
 }
 
-func buildHTTPClient(ctx context.Context, m sigV4RequestModel) (*http.Client, error) {
+func buildHTTPClient(ctx context.Context, m sigV4RequestModel, diags *diag.Diagnostics) (*http.Client, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if m.Insecure.ValueBool() {
 		tlsCfg.InsecureSkipVerify = true
@@ -650,13 +701,13 @@ func buildHTTPClient(ctx context.Context, m sigV4RequestModel) (*http.Client, er
 		tlsCfg.RootCAs = pool
 	}
 
-	timeout := time.Duration(0)
-	if !m.RequestTimeoutMs.IsNull() && !m.RequestTimeoutMs.IsUnknown() && m.RequestTimeoutMs.ValueInt64() > 0 {
-		timeout = time.Duration(m.RequestTimeoutMs.ValueInt64()) * time.Millisecond
+	timeout, _ := parseDurationField(m.RequestTimeout, path.Root("request_timeout"), diags)
+	if diags.HasError() {
+		return nil, nil
 	}
 
 	followRedirects := m.FollowRedirects.ValueBool()
-	maxRedirects := int(defaultMaxRedirects)
+	maxRedirects := defaultMaxRedirects
 	if !m.MaxRedirects.IsNull() && !m.MaxRedirects.IsUnknown() {
 		maxRedirects = int(m.MaxRedirects.ValueInt64())
 	}
