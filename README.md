@@ -4,113 +4,100 @@ A Terraform provider that exposes a single [ephemeral resource](https://develope
 
 It sits at the intersection of the [`http` data source](https://registry.terraform.io/providers/hashicorp/http/latest/docs/data-sources/http) and the [`aws_lambda_invocation` ephemeral resource](https://registry.terraform.io/providers/-/aws/latest/docs/ephemeral-resources/lambda_invocation): a flexible HTTP client, plus the full AWS SDK default credential provider chain.
 
+The complete schema reference lives in [`docs/index.md`](docs/index.md) (provider) and [`docs/ephemeral-resources/request.md`](docs/ephemeral-resources/request.md) (resource). Both are generated from the Go schema and verified by CI.
+
 ## Why ephemeral?
 
-Responses from SigV4-signed endpoints often contain credentials or secrets that should not be written to Terraform state. Ephemeral resources are re-evaluated on every plan/apply and their results never persist.
+Responses from SigV4-signed endpoints often contain credentials or other secrets that should not be written to Terraform state. Ephemeral resources are re-evaluated on every plan/apply and their results never persist.
 
-## Provider configuration
+## Quick example
 
-All fields are optional. When omitted, the standard AWS SDK default credential provider chain applies — environment variables, the shared config/credentials files (including `credential_process` and SSO profiles), container/IMDS, assume-role and assume-role-with-web-identity.
-
-There is no provider-level `region` attribute. The SigV4 signing region is resolved in this order: the ephemeral resource's `region` argument, then `AWS_REGION` / `AWS_DEFAULT_REGION`, then the active profile's `region` setting.
+A realistic use case: exchange AWS-IAM-signed identity for a short-lived OIDC token, then hand it to another provider.
 
 ```hcl
 terraform {
   required_providers {
-    awssigv4 = {
-      source = "asana/awssigv4"
-    }
+    awssigv4 = { source = "asana/awssigv4" }
+    github   = { source = "integrations/github" }
   }
 }
 
 provider "awssigv4" {
-  profile                  = "engineering"     # named profile (region comes from the profile)
-  shared_config_files      = ["~/.aws/config"]
-  shared_credentials_files = ["~/.aws/credentials"]
+  profile = "engineering"
+}
 
-  # Static credentials (rarely needed, strongly discouraged)
-  # access_key = "..."
-  # secret_key = "..."
-  # token      = "..."
+ephemeral "awssigv4_request" "github_token" {
+  url     = "https://oidc.example.com/exchange"
+  service = "execute-api"
+  method  = "POST"
+
+  request_headers = { "Content-Type" = "application/json" }
+  request_body    = jsonencode({ audience = "github" })
+
+  # Fail the plan if anything other than a 200 comes back. Without this,
+  # a 401/500 with an empty body would surface as a confusing
+  # `jsondecode(...) failed: EOF` downstream.
+  expected_status_codes = [200]
+
+  retry {
+    attempts        = 5
+    multiplier      = 2.0
+    on_status_codes = [429, 502, 503, 504]
+  }
+}
+
+provider "github" {
+  token = jsondecode(ephemeral.awssigv4_request.github_token.response_body).token
+}
+```
+
+`response_body` is marked sensitive — Terraform won't print it in plan output, and the value propagates as sensitive into the consuming provider.
+
+## Provider configuration
+
+All provider fields are optional. When omitted, the standard AWS SDK default credential provider chain applies: environment variables, the shared config/credentials files (including `credential_process` and SSO profiles), container/IMDS, assume-role, and assume-role-with-web-identity.
+
+There is no provider-level `region` attribute. The SigV4 signing region is resolved in this order: the ephemeral resource's `region` argument, then `AWS_REGION` / `AWS_DEFAULT_REGION`, then the active profile's `region` setting.
+
+A more involved configuration that names a profile and assumes a role:
+
+```hcl
+provider "awssigv4" {
+  profile = "engineering"
 
   assume_role {
     role_arn         = "arn:aws:iam::123456789012:role/terraform"
     session_name     = "terraform-awssigv4"
     duration_seconds = 3600
   }
-
-  # assume_role_with_web_identity { role_arn = "...", web_identity_token_file = "..." }
-
-  # max_retries                 = 3
-  # retry_mode                  = "adaptive"
-  # skip_credentials_validation = true
-  # skip_metadata_api_check     = true
-  # use_fips_endpoint           = false
-  # use_dualstack_endpoint      = false
-  # custom_ca_bundle            = "/etc/ssl/certs/ca-bundle.crt"
-  # http_proxy / https_proxy / no_proxy
-  # sts_endpoint / sts_region
-  # ec2_metadata_service_endpoint / ec2_metadata_service_endpoint_mode
 }
 ```
+
+For the full list of provider attributes (static credentials, custom CA bundles, proxy settings, STS overrides, IMDS controls, FIPS/dual-stack endpoints, web-identity assume-role, etc.), see [`docs/index.md`](docs/index.md).
 
 ## Ephemeral resource: `awssigv4_request`
 
-```hcl
-ephemeral "awssigv4_request" "invoke" {
-  url     = "https://abcdef1234.execute-api.us-east-1.amazonaws.com/prod/items"
-  service = "execute-api"
-  region  = "us-east-1"   # optional; falls back to configured region
-  method  = "POST"
+The resource accepts the request inputs you'd expect (`url`, `method`, `service`, `region`, `request_headers`, `request_body`, plus TLS and timeout controls) and exposes the response as a set of computed attributes (`status_code`, `ok`, `response_headers`, `response_body`, `response_body_base64`, `response_body_is_utf8`, `attempts`).
 
-  request_headers = {
-    "Content-Type" = "application/json"
-  }
-  request_body = jsonencode({ id = "42" })
+Notable behaviors that aren't obvious from the field names:
 
-  request_timeout_ms = 10000
-}
+- **Status enforcement** via `expected_status_codes = [200]` turns a non-matching status into a plan error. By default, the response body is *not* included in that diagnostic — set `include_response_body_in_errors = true` to include it, but only when you're confident the body cannot contain sensitive material (a misconfigured allowlist would otherwise leak the body into plaintext error output).
+- **Retries** via the `retry { ... }` block re-sign every attempt, so SigV4's signature time window doesn't bound your retry budget. Configurable `multiplier`, `min_delay_ms`, `max_delay_ms`, `on_status_codes`, and `on_connection_errors`.
+- **Redirects** are off by default (`follow_redirects = false`) because SigV4 signs the original host and path — following a redirect either drops the signature (cross-host, Go strips `Authorization`) or sends an invalid one (same-host, different path). When enabled, `allowed_redirect_hosts` gates destinations.
+- **`X-Amz-Content-Sha256` is opt-in** (`set_content_sha256_header = true`). S3 requires it; most other services don't.
+- **`sign_body = false`** signs with `UNSIGNED-PAYLOAD` instead of hashing the body — useful for streaming uploads.
+- **`max_response_body_bytes`** caps how much body is read into memory. Unset means no cap.
 
-output "status" {
-  ephemeral = true
-  value     = ephemeral.awssigv4_request.invoke.status_code
-}
-```
-
-### Arguments
-
-| Argument | Type | Required | Description |
-| --- | --- | --- | --- |
-| `url` | string | yes | Full URL to request. |
-| `service` | string | yes | SigV4 service name (e.g. `execute-api`, `lambda`, `s3`, `appsync`, `bedrock`). |
-| `method` | string | no | HTTP method. Defaults to `GET`, or `POST` when `request_body` is set. |
-| `region` | string | no | SigV4 signing region. Falls back to the AWS SDK's resolution (env vars, active profile). |
-| `request_headers` | map(string) | no | Headers attached before signing. |
-| `request_body` | string | no | Request body. Hashed for SigV4 unless `sign_body = false`. |
-| `request_timeout_ms` | number | no | Per-request timeout in milliseconds. |
-| `ca_cert_pem` | string | no | Extra PEM-encoded CA bundle for the target endpoint. |
-| `insecure` | bool | no | Skip TLS verification of the target endpoint. |
-| `sign_body` | bool | no | If `false`, signs with `UNSIGNED-PAYLOAD` instead of hashing the body (useful for S3 streaming). Defaults to `true`. |
-| `set_content_sha256_header` | bool | no | If `true`, set the `X-Amz-Content-Sha256` header to the value used when signing. S3 requires this; most other services do not. Defaults to `false`. |
-
-### Computed attributes
-
-| Attribute | Type | Description |
-| --- | --- | --- |
-| `status_code` | number | HTTP response status code. |
-| `ok` | bool | `true` when `status_code` is in the 2xx range. |
-| `response_headers` | map(string) | Response headers (first value per header name). |
-| `response_body` | string (sensitive) | Response body as a UTF-8 string. Empty if the body is not valid UTF-8 — see `response_body_is_utf8` to disambiguate from an empty body. |
-| `response_body_base64` | string (sensitive) | Response body, base64-encoded — always set, including binary responses. |
-| `response_body_is_utf8` | bool | `true` when the response body is valid UTF-8 (and thus safely represented in `response_body`). |
+See [`docs/ephemeral-resources/request.md`](docs/ephemeral-resources/request.md) for the full schema, and [`examples/ephemeral-resources/awssigv4_request/`](examples/ephemeral-resources/awssigv4_request/) for a few HCL snippets.
 
 ## Building locally
 
 ```sh
-go build ./...                  # build
-go test ./...                   # unit tests
-cd tools && go generate ./...   # regenerate docs/ via tfplugindocs
+go build ./...
+go test ./...
 ```
+
+The generated `docs/` tree is verified by [`.github/workflows/test.yml`](.github/workflows/test.yml) on every PR — if you've changed the schema, run `cd tools && go generate ./...` and commit the result; CI will fail otherwise.
 
 For local development against a real Terraform config, add a `dev_overrides` block to `~/.terraformrc`:
 

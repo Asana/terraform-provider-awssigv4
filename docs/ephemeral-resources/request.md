@@ -61,21 +61,41 @@ ephemeral "awssigv4_request" "fetch_object" {
 
 ### Optional
 
+- `allowed_redirect_hosts` (List of String) When `follow_redirects = true`, restrict redirect destinations to these hostnames (exact match, case-insensitive). Unset or empty means allow any host.
 - `ca_cert_pem` (String) Additional PEM-encoded CA bundle to trust when verifying the target endpoint's TLS certificate.
+- `expected_status_codes` (List of Number) If set, fail the plan when the response status code is not in this list. Unset means no enforcement — the caller can still gate downstream on `ok` or `status_code`.
+- `follow_redirects` (Boolean) If `true`, follow HTTP redirects. Defaults to `false` because SigV4 signs the original host and path — following a redirect either drops the signature (cross-host) or sends an invalid signature (same-host, different path). Combine with `allowed_redirect_hosts` to gate destinations.
+- `include_response_body_in_errors` (Boolean) If `true`, the response body is included in the diagnostic emitted when `expected_status_codes` doesn't match. Defaults to `false` because a misconfigured allowlist (e.g. expecting `201` but the endpoint returns `200`) would leak the response body — which often contains tokens or other secrets — into Terraform's plaintext error output. Diagnostics always include the status code, attempt count, body byte length, and `Content-Type` header even when this is `false`.
 - `insecure` (Boolean) Skip TLS verification of the target endpoint.
+- `max_redirects` (Number) Maximum redirects to follow when `follow_redirects = true`. Defaults to `10`.
+- `max_response_body_bytes` (Number) Cap on response body size in bytes. If the server returns more, the request fails. `0` (default) means no cap.
 - `method` (String) HTTP method. Defaults to `GET`, or `POST` when `request_body` is set.
 - `region` (String) SigV4 signing region. When omitted, falls back to the region resolved by the AWS SDK (`AWS_REGION`/`AWS_DEFAULT_REGION` env var, or the active profile's `region` setting).
 - `request_body` (String) Request body. Hashed for SigV4 unless `sign_body = false`.
 - `request_headers` (Map of String) Headers to attach before signing. `Host`, `X-Amz-Date`, `Authorization`, and `X-Amz-Security-Token` are set by the signer; values for them are overwritten.
-- `request_timeout_ms` (Number) Per-request timeout in milliseconds. `0` (default) means no client-side timeout.
+- `request_timeout_ms` (Number) Per-attempt timeout in milliseconds. `0` (default) means no client-side timeout. With retries enabled, this applies to each attempt individually.
+- `retry` (Block, Optional) Retry transient failures. Each attempt is signed afresh, so SigV4's time-skew window does not bound the total retry budget. (see [below for nested schema](#nestedblock--retry))
 - `set_content_sha256_header` (Boolean) If `true`, set the `X-Amz-Content-Sha256` request header to the value used when signing (either the body's SHA-256 hex digest, or `UNSIGNED-PAYLOAD` when `sign_body = false`). S3 requires this header; most other services do not. Defaults to `false`.
 - `sign_body` (Boolean) If `false`, signs the request with `UNSIGNED-PAYLOAD` instead of hashing the body. Useful for streaming uploads to services like S3. Defaults to `true`.
 
 ### Read-Only
 
+- `attempts` (Number) Number of attempts made, including the successful one. `1` when no retries occurred.
 - `ok` (Boolean) `true` when `status_code` is in the 2xx range.
 - `response_body` (String, Sensitive) Response body as a UTF-8 string. Empty if the response body is not valid UTF-8 — use `response_body_is_utf8` to disambiguate from a genuinely empty body.
 - `response_body_base64` (String, Sensitive) Response body, base64-encoded — set for any response, including binary ones.
 - `response_body_is_utf8` (Boolean) `true` when the response body is valid UTF-8 (and therefore safely represented in `response_body`).
 - `response_headers` (Map of String) Response headers (first value per header).
-- `status_code` (Number) HTTP response status code.
+- `status_code` (Number) HTTP response status code of the final attempt.
+
+<a id="nestedblock--retry"></a>
+### Nested Schema for `retry`
+
+Optional:
+
+- `attempts` (Number) Total attempts including the first one. Defaults to `3` when the block is present.
+- `max_delay_ms` (Number) Upper bound on the backoff delay, in milliseconds. Defaults to `30000`.
+- `min_delay_ms` (Number) Initial delay before the first retry, in milliseconds. Defaults to `1000`.
+- `multiplier` (Number) Backoff multiplier applied between attempts. Each delay is `min_delay_ms * multiplier^(retry_index)`, capped at `max_delay_ms`. Defaults to `2.0` (exponential doubling); set to `1.0` for constant delay.
+- `on_connection_errors` (Boolean) Retry on network/TLS/connection errors. Defaults to `true`.
+- `on_status_codes` (List of Number) Response status codes that trigger a retry. Defaults to `[408, 429, 500, 502, 503, 504]`. Set to `[]` to disable status-based retries entirely.
