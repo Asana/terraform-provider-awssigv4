@@ -1,0 +1,90 @@
+# Terraform Provider release workflow.
+name: Release
+
+# Manually triggered from the Actions UI against the main branch. The workflow
+# creates the v<version> tag itself, so the IAM role's trust policy only needs
+# to allow refs/heads/main — not protected tag refs.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release without leading v, e.g. 0.1.0'
+        required: true
+        type: string
+
+# `contents: write` lets the job push a tag and lets goreleaser create the
+# GitHub release. `id-token: write` lets the job assume an AWS role via
+# GitHub OIDC.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    # Only allow running this from main, even though workflow_dispatch already
+    # requires a ref to be selected — belt-and-suspenders.
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Allow goreleaser to access older tag information.
+          fetch-depth: 0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must look like X.Y.Z[-prerelease], got: $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Create and push tag
+        env:
+          TAG: v${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists; refusing to overwrite." >&2
+            exit 1
+          fi
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::687448084181:role/autogen_github_actions_terraform-infra_provider_publish
+
+      - name: Load release GPG key
+        uses: aws-actions/aws-secretsmanager-get-secrets@v2
+        with:
+          # The secret stores a JSON object with key `private_key` (the ASCII-armored
+          # private key). `parse-json-secrets` exposes it as the env var
+          # `GPG_PRIVATE_KEY`.
+          secret-ids: GPG,terraform_provider_gpg_key
+          parse-json-secrets: true
+
+      - name: Import GPG key
+        id: import_gpg
+        run: |
+          set -euo pipefail
+          gpg --batch --import <<< "$GPG_PRIVATE_KEY"
+          fpr=$(gpg --with-colons --list-secret-keys | awk -F: '/^fpr:/ {print $10; exit}')
+          echo "fingerprint=$fpr" >> "$GITHUB_OUTPUT"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
+        with:
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}

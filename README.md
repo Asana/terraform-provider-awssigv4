@@ -107,10 +107,59 @@ output "status" {
 ## Building locally
 
 ```sh
-go build ./...
+go build ./...                  # build
+go test ./...                   # unit tests
+cd tools && go generate ./...   # regenerate docs/ via tfplugindocs
 ```
 
-To use a local build, follow the [Terraform plugin development overrides](https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides-for-provider-developers) docs.
+For local development against a real Terraform config, add a `dev_overrides` block to `~/.terraformrc`:
+
+```hcl
+provider_installation {
+  dev_overrides {
+    "asana/awssigv4" = "/absolute/path/to/this/repo"
+  }
+  direct {}
+}
+```
+
+Then `go install .` and run `terraform plan` directly — skip `terraform init`. See the [Terraform plugin development overrides](https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides-for-provider-developers) docs.
+
+## Releasing
+
+Releases are manually triggered from [`.github/workflows/release.yml`](.github/workflows/release.yml): open the Actions tab, pick **Release**, choose `main` as the ref, and enter the version (e.g. `0.1.0`). The workflow validates the version string, creates and pushes the `v<version>` tag itself, then runs [GoReleaser](https://goreleaser.com) using [`.goreleaser.yml`](.goreleaser.yml) to build binaries for the platform matrix the Terraform Registry requires and GPG-sign the `SHA256SUMS` checksum file.
+
+The release-from-`main` flow lets the IAM role's trust policy be scoped to `refs/heads/main`. Branch protection on `main` is then the security boundary, instead of tag protection. Once tag protection is set up, switch the workflow's `on:` trigger back to `push.tags: ['v*']` and remove the tag-creation step.
+
+One-time setup before the first release:
+
+1. **Generate a dedicated, passphraseless GPG key** for release signing (do not reuse your personal key). RSA or DSA, not ECC.
+   ```sh
+   gpg --batch --gen-key <<EOF
+   %no-protection
+   Key-Type: RSA
+   Key-Length: 4096
+   Name-Real: terraform-provider-awssigv4 releases
+   Name-Email: releases@example.invalid
+   Expire-Date: 0
+   %commit
+   EOF
+   ```
+2. Export the **public** key (ASCII-armored) and upload it under **User Settings → Signing Keys** on the Terraform Registry:
+   ```sh
+   gpg --armor --export <fingerprint>
+   ```
+3. Store the **private** key in **AWS Secrets Manager** as `terraform_provider_gpg_key`. Use a JSON value with a single key, `private_key`:
+   ```sh
+   PRIVATE_KEY="$(gpg --armor --export-secret-keys <fingerprint>)" \
+     jq -n --arg private_key "$PRIVATE_KEY" '{private_key: $private_key}' \
+   | aws secretsmanager create-secret \
+       --name terraform_provider_gpg_key \
+       --secret-string file:///dev/stdin
+   ```
+   The release workflow reads the secret via `aws-actions/aws-secretsmanager-get-secrets`, which exposes it as the `GPG_PRIVATE_KEY` environment variable.
+4. **Provision the IAM role** the workflow assumes via GitHub OIDC. The role ARN is already wired in `.github/workflows/release.yml`. Its trust policy should restrict `sts:AssumeRoleWithWebIdentity` to this repository's main branch (`repo:Asana/terraform-provider-awssigv4:ref:refs/heads/main`); its inline policy needs `secretsmanager:GetSecretValue` on the secret ARN above.
+5. Publish the provider once via **Publish → Provider** on the Registry. Subsequent releases are picked up automatically from the GitHub release webhook.
 
 ## Attribution
 
