@@ -42,8 +42,13 @@ ephemeral "awssigv4_request" "github_token" {
   retry {
     attempts        = 5
     multiplier      = 2.0
+    min_delay       = "500ms"
+    max_delay       = "10s"
     on_status_codes = [429, 502, 503, 504]
   }
+
+  request_timeout = "5s"   # per-attempt
+  timeouts { open = "30s" } # end-to-end (all attempts + backoffs)
 }
 
 provider "github" {

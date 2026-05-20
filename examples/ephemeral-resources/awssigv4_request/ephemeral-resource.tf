@@ -22,7 +22,18 @@ ephemeral "awssigv4_request" "invoke_lambda" {
     action = "warmup"
   })
 
-  request_timeout_ms = 10000
+  request_timeout = "10s"
+
+  retry {
+    attempts        = 3
+    min_delay       = "1s"
+    max_delay       = "10s"
+    on_status_codes = [429, 502, 503, 504]
+  }
+
+  timeouts {
+    open = "1m"
+  }
 }
 
 # GET an object from S3. S3 requires the X-Amz-Content-Sha256 header, so

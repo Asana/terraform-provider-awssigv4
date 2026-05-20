@@ -37,7 +37,18 @@ ephemeral "awssigv4_request" "invoke_lambda" {
     action = "warmup"
   })
 
-  request_timeout_ms = 10000
+  request_timeout = "10s"
+
+  retry {
+    attempts        = 3
+    min_delay       = "1s"
+    max_delay       = "10s"
+    on_status_codes = [429, 502, 503, 504]
+  }
+
+  timeouts {
+    open = "1m"
+  }
 }
 
 # GET an object from S3. S3 requires the X-Amz-Content-Sha256 header, so
@@ -73,10 +84,11 @@ ephemeral "awssigv4_request" "fetch_object" {
 - `region` (String) SigV4 signing region. When omitted, falls back to the region resolved by the AWS SDK (`AWS_REGION`/`AWS_DEFAULT_REGION` env var, or the active profile's `region` setting).
 - `request_body` (String) Request body. Hashed for SigV4 unless `sign_body = false`.
 - `request_headers` (Map of String) Headers to attach before signing. `Host`, `X-Amz-Date`, `Authorization`, and `X-Amz-Security-Token` are set by the signer; values for them are overwritten.
-- `request_timeout_ms` (Number) Per-attempt timeout in milliseconds. `0` (default) means no client-side timeout. With retries enabled, this applies to each attempt individually.
+- `request_timeout` (String) Per-attempt HTTP timeout as a Go duration string (e.g. `"5s"`, `"500ms"`). Unset or empty means no client-side timeout. With retries enabled, this applies to each attempt individually; for an end-to-end budget covering all attempts and backoffs, use `timeouts { open = "..." }`.
 - `retry` (Block, Optional) Retry transient failures. Each attempt is signed afresh, so SigV4's time-skew window does not bound the total retry budget. (see [below for nested schema](#nestedblock--retry))
 - `set_content_sha256_header` (Boolean) If `true`, set the `X-Amz-Content-Sha256` request header to the value used when signing (either the body's SHA-256 hex digest, or `UNSIGNED-PAYLOAD` when `sign_body = false`). S3 requires this header; most other services do not. Defaults to `false`.
 - `sign_body` (Boolean) If `false`, signs the request with `UNSIGNED-PAYLOAD` instead of hashing the body. Useful for streaming uploads to services like S3. Defaults to `true`.
+- `timeouts` (Block, Optional) (see [below for nested schema](#nestedblock--timeouts))
 
 ### Read-Only
 
@@ -94,8 +106,16 @@ ephemeral "awssigv4_request" "fetch_object" {
 Optional:
 
 - `attempts` (Number) Total attempts including the first one. Defaults to `3` when the block is present.
-- `max_delay_ms` (Number) Upper bound on the backoff delay, in milliseconds. Defaults to `30000`.
-- `min_delay_ms` (Number) Initial delay before the first retry, in milliseconds. Defaults to `1000`.
+- `max_delay` (String) Upper bound on the backoff delay as a Go duration string. Defaults to `"30s"`.
+- `min_delay` (String) Initial delay before the first retry as a Go duration string (e.g. `"1s"`, `"500ms"`). Defaults to `"1s"`.
 - `multiplier` (Number) Backoff multiplier applied between attempts. Each delay is `min_delay_ms * multiplier^(retry_index)`, capped at `max_delay_ms`. Defaults to `2.0` (exponential doubling); set to `1.0` for constant delay.
 - `on_connection_errors` (Boolean) Retry on network/TLS/connection errors. Defaults to `true`.
 - `on_status_codes` (List of Number) Response status codes that trigger a retry. Defaults to `[408, 429, 500, 502, 503, 504]`. Set to `[]` to disable status-based retries entirely.
+
+
+<a id="nestedblock--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `open` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
